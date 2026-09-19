@@ -11,7 +11,10 @@ Example:
 """
 
 import fnmatch
+import os
+import stat
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 from scripts.quick_validate import validate_skill
@@ -39,6 +42,33 @@ def should_exclude(rel_path: Path) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_GLOBS)
 
 
+def package_files(skill_path: Path) -> list[tuple[Path, Path]]:
+    """Preflight every included path before reading metadata or writing an archive."""
+    files = []
+    for file_path in sorted(skill_path.rglob('*')):
+        arcname = file_path.relative_to(skill_path.parent)
+        if should_exclude(arcname):
+            continue
+        if file_path.is_symlink() or not file_path.resolve().is_relative_to(skill_path):
+            raise ValueError(f"symlink or external package path: {arcname}")
+        if file_path.is_file():
+            files.append((file_path, arcname))
+    return files
+
+
+def read_package_file(file_path: Path, skill_path: Path) -> bytes:
+    """Reject changed links and non-regular files before reading their bytes."""
+    before = file_path.lstat()
+    if not stat.S_ISREG(before.st_mode) or not file_path.resolve().is_relative_to(skill_path):
+        raise ValueError(f"unsafe package file: {file_path.name}")
+    descriptor = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"package file changed during read: {file_path.name}")
+        return stream.read()
+
+
 def package_skill(skill_path, output_dir=None):
     """
     Package a skill folder into a .skill file.
@@ -50,7 +80,11 @@ def package_skill(skill_path, output_dir=None):
     Returns:
         Path to the created .skill file, or None if error
     """
-    skill_path = Path(skill_path).resolve()
+    skill_path = Path(skill_path)
+    if skill_path.is_symlink():
+        print("❌ Skill root must not be a symlink")
+        return None
+    skill_path = skill_path.resolve()
 
     # Validate skill folder exists
     if not skill_path.exists():
@@ -67,6 +101,12 @@ def package_skill(skill_path, output_dir=None):
         print(f"❌ Error: SKILL.md not found in {skill_path}")
         return None
 
+    try:
+        files = package_files(skill_path)
+    except (ValueError, OSError) as exc:
+        print(f"❌ Package preflight failed: {exc}")
+        return None
+
     # Run validation before packaging
     print("🔍 Validating skill...")
     valid, message = validate_skill(skill_path)
@@ -80,25 +120,28 @@ def package_skill(skill_path, output_dir=None):
     skill_name = skill_path.name
     if output_dir:
         output_path = Path(output_dir).resolve()
-        output_path.mkdir(parents=True, exist_ok=True)
     else:
         output_path = Path.cwd()
 
     skill_filename = output_path / f"{skill_name}.skill"
+    if output_path.is_relative_to(skill_path):
+        print("❌ Output directory must be outside the skill directory")
+        return None
 
     # Create the .skill file (zip format)
+    temporary_path = None
     try:
-        with zipfile.ZipFile(skill_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Walk through the skill directory, excluding build artifacts
-            for file_path in skill_path.rglob('*'):
-                if not file_path.is_file():
-                    continue
-                arcname = file_path.relative_to(skill_path.parent)
-                if should_exclude(arcname):
-                    print(f"  Skipped: {arcname}")
-                    continue
-                zipf.write(file_path, arcname)
+        output_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=output_path, suffix='.skill.tmp', delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        with zipfile.ZipFile(temporary_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path, arcname in files:
+                payload = read_package_file(file_path, skill_path)
+                info = zipfile.ZipInfo.from_file(file_path, arcname.as_posix())
+                info.compress_type = zipfile.ZIP_DEFLATED
+                zipf.writestr(info, payload)
                 print(f"  Added: {arcname}")
+        temporary_path.replace(skill_filename)
 
         print(f"\n✅ Successfully packaged skill to: {skill_filename}")
         return skill_filename
@@ -106,6 +149,9 @@ def package_skill(skill_path, output_dir=None):
     except Exception as e:
         print(f"❌ Error creating .skill file: {e}")
         return None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def main():
