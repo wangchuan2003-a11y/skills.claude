@@ -19,17 +19,57 @@ import socket
 import time
 import sys
 import argparse
+import os
+import signal
 
-def is_server_ready(port, timeout=30):
-    """Wait for server to be ready by polling the port."""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            with socket.create_connection(('localhost', port), timeout=1):
-                return True
-        except (socket.error, ConnectionRefusedError):
-            time.sleep(0.5)
+def port_open(port):
+    try:
+        with socket.create_connection(('localhost', port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def is_server_ready(port, timeout=30, process=None):
+    """Wait for our server, rejecting an early launcher failure."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
+        if port_open(port):
+            return True
+        time.sleep(0.05)
     return False
+
+
+def stop_process(process):
+    """Kill the whole session's process group, even if its shell has exited."""
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=5)
+
+
+def process_options():
+    return ({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt'
+            else {'start_new_session': True})
 
 
 def main():
@@ -58,7 +98,18 @@ def main():
     for cmd, port in zip(args.servers, args.ports):
         servers.append({'cmd': cmd, 'port': port})
 
+    if args.timeout <= 0 or len(set(args.ports)) != len(args.ports):
+        parser.error("timeout must be positive and ports must be distinct")
+    if any(not 1 <= port <= 65535 for port in args.ports):
+        parser.error("ports must be between 1 and 65535")
+    if any(port_open(port) for port in args.ports):
+        parser.error("a requested port is already in use")
+
     server_processes = []
+    command_process = None
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+    old_handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT)}
 
     try:
         # Start all servers
@@ -69,14 +120,14 @@ def main():
             process = subprocess.Popen(
                 server['cmd'],
                 shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                # Inherit output: no unread pipe can block a noisy server.
+                **process_options()
             )
             server_processes.append(process)
 
             # Wait for this server to be ready
             print(f"Waiting for server on port {server['port']}...")
-            if not is_server_ready(server['port'], timeout=args.timeout):
+            if not is_server_ready(server['port'], timeout=args.timeout, process=process):
                 raise RuntimeError(f"Server failed to start on port {server['port']} within {args.timeout}s")
 
             print(f"Server ready on port {server['port']}")
@@ -85,21 +136,22 @@ def main():
 
         # Run the command
         print(f"Running: {' '.join(args.command)}\n")
-        result = subprocess.run(args.command)
-        sys.exit(result.returncode)
+        command_process = subprocess.Popen(args.command, **process_options())
+        sys.exit(command_process.wait())
 
     finally:
-        # Clean up all servers
-        print(f"\nStopping {len(server_processes)} server(s)...")
-        for i, process in enumerate(server_processes):
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            print(f"Server {i+1} stopped")
-        print("All servers stopped")
+        # Ignore repeat interrupts while cleaning up; restore handlers afterwards.
+        for sig in old_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if command_process is not None:
+                stop_process(command_process)
+            for process in reversed(server_processes):
+                stop_process(process)
+        finally:
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
+        print("All server process groups stopped")
 
 
 if __name__ == '__main__':

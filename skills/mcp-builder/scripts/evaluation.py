@@ -6,15 +6,16 @@ This script evaluates MCP servers by running test questions against them using C
 import argparse
 import asyncio
 import json
+import math
+import os
 import re
 import sys
 import time
-import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 
 from connections import create_connection
 
@@ -83,87 +84,105 @@ def extract_xml_content(text: str, tag: str) -> str | None:
     return matches[-1].strip() if matches else None
 
 
+class EvaluationBudgetExceeded(RuntimeError):
+    def __init__(self, reason, tool_metrics, messages):
+        super().__init__(reason)
+        self.tool_metrics = tool_metrics
+        self.messages = messages
+
+
+def validate_budgets(max_rounds, max_seconds, max_tool_calls):
+    if (type(max_rounds) is not int or max_rounds < 1 or
+            type(max_tool_calls) is not int or max_tool_calls < 1 or
+            not math.isfinite(max_seconds) or max_seconds <= 0):
+        raise ValueError("Budgets must be finite and positive; rounds and calls must be integers")
+
+
 async def agent_loop(
-    client: Anthropic,
+    client: AsyncAnthropic,
     model: str,
     question: str,
     tools: list[dict[str, Any]],
     connection: Any,
+    *,
+    max_rounds: int = 20,
+    max_seconds: float = 120,
+    max_tool_calls: int = 100,
 ) -> tuple[str, dict[str, Any]]:
-    """Run the agent loop with MCP tools."""
+    """Bound each task, including model requests and sequential MCP calls."""
+    validate_budgets(max_rounds, max_seconds, max_tool_calls)
     messages = [{"role": "user", "content": question}]
-
-    response = await asyncio.to_thread(
-        client.messages.create,
-        model=model,
-        max_tokens=4096,
-        system=EVALUATION_PROMPT,
-        messages=messages,
-        tools=tools,
-    )
-
-    messages.append({"role": "assistant", "content": response.content})
-
     tool_metrics = {}
+    deadline = time.monotonic() + max_seconds
+    calls = 0
 
-    while response.stop_reason == "tool_use":
-        tool_use = next(block for block in response.content if block.type == "tool_use")
-        tool_name = tool_use.name
-        tool_input = tool_use.input
-
-        tool_start_ts = time.time()
+    async def bounded(operation):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EvaluationBudgetExceeded("Total time budget exhausted", tool_metrics, messages)
         try:
-            tool_result = await connection.call_tool(tool_name, tool_input)
-            tool_response = json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
-        except Exception as e:
-            tool_response = f"Error executing tool {tool_name}: {str(e)}\n"
-            tool_response += traceback.format_exc()
-        tool_duration = time.time() - tool_start_ts
+            return await asyncio.wait_for(operation(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise EvaluationBudgetExceeded("Total time budget exhausted", tool_metrics, messages) from exc
 
-        if tool_name not in tool_metrics:
-            tool_metrics[tool_name] = {"count": 0, "durations": []}
-        tool_metrics[tool_name]["count"] += 1
-        tool_metrics[tool_name]["durations"].append(tool_duration)
-
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use.id,
-                "content": tool_response,
-            }]
-        })
-
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model=model,
-            max_tokens=4096,
-            system=EVALUATION_PROMPT,
-            messages=messages,
-            tools=tools,
-        )
+    for _ in range(max_rounds):
+        response = await bounded(lambda: client.messages.create(
+            model=model, max_tokens=4096, system=EVALUATION_PROMPT,
+            messages=messages, tools=tools,
+        ))
         messages.append({"role": "assistant", "content": response.content})
-
-    response_text = next(
-        (block.text for block in response.content if hasattr(block, "text")),
-        None,
-    )
-    return response_text, tool_metrics
+        if response.stop_reason != "tool_use":
+            return "\n".join(block.text for block in response.content
+                             if block.type == "text"), tool_metrics
+        tool_uses = [block for block in response.content if block.type == "tool_use"]
+        if not tool_uses:
+            raise ValueError("Model requested tool_use without tool calls")
+        # Reject a batch before executing any of it if it would exceed the budget.
+        if calls + len(tool_uses) > max_tool_calls:
+            raise EvaluationBudgetExceeded("Tool call budget exhausted", tool_metrics, messages)
+        results = []
+        messages.append({"role": "user", "content": results})
+        for tool_use in tool_uses:
+            calls += 1
+            started = time.monotonic()
+            is_error = False
+            try:
+                result = await bounded(lambda: connection.call_tool(tool_use.name, tool_use.input))
+                is_error = isinstance(result, dict) and bool(result.get("isError", False))
+                content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            except EvaluationBudgetExceeded:
+                raise
+            except Exception as exc:
+                is_error = True
+                content = f"Error executing tool {tool_use.name}: {exc}"
+            finally:
+                metrics = tool_metrics.setdefault(tool_use.name, {"count": 0, "durations": []})
+                metrics["count"] += 1
+                metrics["durations"].append(time.monotonic() - started)
+            results.append({"type": "tool_result", "tool_use_id": tool_use.id,
+                            "content": content, "is_error": is_error})
+    raise EvaluationBudgetExceeded("Model round budget exhausted", tool_metrics, messages)
 
 
 async def evaluate_single_task(
-    client: Anthropic,
+    client: AsyncAnthropic,
     model: str,
     qa_pair: dict[str, Any],
     tools: list[dict[str, Any]],
     connection: Any,
     task_index: int,
+    **budgets,
 ) -> dict[str, Any]:
     """Evaluate a single QA pair with the given tools."""
     start_time = time.time()
 
     print(f"Task {task_index + 1}: Running task with question: {qa_pair['question']}")
-    response, tool_metrics = await agent_loop(client, model, qa_pair["question"], tools, connection)
+    error = None
+    try:
+        response, tool_metrics = await agent_loop(client, model, qa_pair["question"], tools, connection, **budgets)
+    except EvaluationBudgetExceeded as exc:
+        response, tool_metrics = "", exc.tool_metrics
+        error = str(exc)
 
     response_value = extract_xml_content(response, "response")
     summary = extract_xml_content(response, "summary")
@@ -172,6 +191,7 @@ async def evaluate_single_task(
     duration_seconds = time.time() - start_time
 
     return {
+        "error": error,
         "question": qa_pair["question"],
         "expected": qa_pair["answer"],
         "actual": response_value,
@@ -180,7 +200,7 @@ async def evaluate_single_task(
         "tool_calls": tool_metrics,
         "num_tool_calls": sum(len(metrics["durations"]) for metrics in tool_metrics.values()),
         "summary": summary,
-        "feedback": feedback,
+        "feedback": error or feedback,
     }
 
 
@@ -220,24 +240,27 @@ TASK_TEMPLATE = """
 async def run_evaluation(
     eval_path: Path,
     connection: Any,
-    model: str = "claude-3-7-sonnet-20250219",
+    model: str,
+    **budgets,
 ) -> str:
     """Run evaluation with MCP server tools."""
     print("🚀 Starting Evaluation")
 
-    client = Anthropic()
+    if not model or not model.strip():
+        raise ValueError("Specify a model with --model or ANTHROPIC_MODEL")
 
-    tools = await connection.list_tools()
-    print(f"📋 Loaded {len(tools)} tools from MCP server")
+    async with AsyncAnthropic(max_retries=0) as client:
+        tools = await connection.list_tools()
+        print(f"📋 Loaded {len(tools)} tools from MCP server")
 
-    qa_pairs = parse_evaluation_file(eval_path)
-    print(f"📋 Loaded {len(qa_pairs)} evaluation tasks")
+        qa_pairs = parse_evaluation_file(eval_path)
+        print(f"📋 Loaded {len(qa_pairs)} evaluation tasks")
 
-    results = []
-    for i, qa_pair in enumerate(qa_pairs):
-        print(f"Processing task {i + 1}/{len(qa_pairs)}")
-        result = await evaluate_single_task(client, model, qa_pair, tools, connection, i)
-        results.append(result)
+        results = []
+        for i, qa_pair in enumerate(qa_pairs):
+            print(f"Processing task {i + 1}/{len(qa_pairs)}")
+            result = await evaluate_single_task(client, model, qa_pair, tools, connection, i, **budgets)
+            results.append(result)
 
     correct = sum(r["score"] for r in results)
     accuracy = (correct / len(results)) * 100 if results else 0
@@ -315,13 +338,16 @@ Examples:
   python evaluation.py -t sse -u https://example.com/mcp -H "Authorization: Bearer token" eval.xml
 
   # Evaluate an HTTP MCP server with custom model
-  python evaluation.py -t http -u https://example.com/mcp -m claude-3-5-sonnet-20241022 eval.xml
+  python evaluation.py -t http -u https://example.com/mcp -m YOUR_MODEL_ID eval.xml
         """,
     )
 
     parser.add_argument("eval_file", type=Path, help="Path to evaluation XML file")
     parser.add_argument("-t", "--transport", choices=["stdio", "sse", "http"], default="stdio", help="Transport type (default: stdio)")
-    parser.add_argument("-m", "--model", default="claude-3-7-sonnet-20250219", help="Claude model to use (default: claude-3-7-sonnet-20250219)")
+    parser.add_argument("-m", "--model", default=os.environ.get("ANTHROPIC_MODEL"), help="Model ID (or set ANTHROPIC_MODEL); no implicit model")
+    parser.add_argument("--max-rounds", type=int, default=20, help="Model requests per task (default: 20)")
+    parser.add_argument("--max-seconds", type=float, default=120, help="Total seconds per task (default: 120)")
+    parser.add_argument("--max-tool-calls", type=int, default=100, help="Tool calls per task (default: 100)")
 
     stdio_group = parser.add_argument_group("stdio options")
     stdio_group.add_argument("-c", "--command", help="Command to run MCP server (stdio only)")
@@ -335,6 +361,12 @@ Examples:
     parser.add_argument("-o", "--output", type=Path, help="Output file for evaluation report (default: stdout)")
 
     args = parser.parse_args()
+    if not args.model or not args.model.strip():
+        parser.error("Specify --model or set ANTHROPIC_MODEL")
+    try:
+        validate_budgets(args.max_rounds, args.max_seconds, args.max_tool_calls)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if not args.eval_file.exists():
         print(f"Error: Evaluation file not found: {args.eval_file}")
@@ -360,7 +392,10 @@ Examples:
 
     async with connection:
         print("✅ Connected successfully")
-        report = await run_evaluation(args.eval_file, connection, args.model)
+        report = await run_evaluation(
+            args.eval_file, connection, args.model, max_rounds=args.max_rounds,
+            max_seconds=args.max_seconds, max_tool_calls=args.max_tool_calls,
+        )
 
         if args.output:
             args.output.write_text(report)
